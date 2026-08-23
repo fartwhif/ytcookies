@@ -22,6 +22,9 @@ CDP_HOST = os.environ.get("CDP_HOST", "127.0.0.1")
 CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 OUT_PATH = os.environ.get("COOKIES_FILE", "/data/cookies.txt")
 POLL_SECONDS = int(os.environ.get("COOKIE_POLL_INTERVAL", "30"))
+# If the cookies file was written from outside (yt-dlp write-back when a
+# mounted service refreshes a cookie), don't clobber it for this long.
+EXTERNAL_WRITE_COOLDOWN = int(os.environ.get("COOKIE_EXTERNAL_COOLDOWN", "120"))
 
 
 def log(msg: str) -> None:
@@ -43,11 +46,15 @@ def cdp_call(ws, msg_id: int, method: str, params: dict | None = None) -> dict:
             return msg.get("result", {})
 
 
-def fetch_cookies() -> list:
+def open_ws() -> "websocket.WebSocket":
     version = http_json(f"http://{CDP_HOST}:{CDP_PORT}/json/version")
-    ws = websocket.create_connection(
+    return websocket.create_connection(
         version["webSocketDebuggerUrl"], timeout=15, origin=""
     )
+
+
+def fetch_cookies() -> list:
+    ws = open_ws()
     try:
         result = cdp_call(ws, 1, "Storage.getCookies")
     finally:
@@ -117,6 +124,132 @@ def atomic_write(path: str, content: str) -> None:
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------------------
+# Plan A: cookies.txt as the persistent source of truth (import phase)
+# ---------------------------------------------------------------------------
+# If the browser is logged out but cookies.txt holds a valid YouTube login
+# (e.g. profile volume was wiped, or another service refreshed the file),
+# inject the file into the browser via CDP Storage.setCookies and reload
+# YouTube. Never clobbers a live session: file values are only imported when
+# the browser has no login of its own, so Google cookie rotations in the live
+# session are never reverted by stale file values.
+
+LOGIN_DOMAIN = "youtube.com"
+IMPORT_RETRY_S = int(os.environ.get("COOKIE_IMPORT_RETRY", "60"))
+_last_import_attempt = 0.0
+_last_imported_fp = None
+
+
+def parse_netscape(path: str) -> list:
+    """Parse a Netscape cookies file into CDP Storage.setCookies dicts."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return out
+    now = time.time()
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        domain, _sub, cpath, secure, expires_s, name, value = parts
+        if not name or name.lower() == "value":
+            continue
+        # __Host-* cookies must be host-only; the Netscape dot form is
+        # rejected by CDP, so drop the leading dot.
+        if name.startswith("__Host-") and domain.startswith("."):
+            domain = domain[1:]
+        try:
+            exp = int(float(expires_s))
+        except ValueError:
+            exp = 0
+        if exp and exp <= now:
+            continue  # skip expired
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": cpath or "/",
+            "secure": secure == "TRUE",
+            "httpOnly": line.startswith("#HttpOnly_"),
+        }
+        if exp > 0:
+            cookie["expires"] = exp
+        out.append(cookie)
+    return out
+
+
+def _cookies_have_login(cookies: list, key="name") -> bool:
+    """Heuristic: does this cookie set look like a valid YouTube login?"""
+    by_name = {}
+    for c in cookies:
+        dom = c.get("domain") or ""
+        if LOGIN_DOMAIN in dom:
+            by_name.setdefault(c.get(key, ""), c.get("value"))
+    if by_name.get("login_info"):
+        return True
+    return bool(by_name.get("SID") and by_name.get("HSID"))
+
+
+def navigate_to_youtube() -> None:
+    """Reload the first page target at YouTube so imported cookies apply."""
+    try:
+        targets = http_json(f"http://{CDP_HOST}:{CDP_PORT}/json")
+        pages = [t for t in targets if t.get("type") == "page"]
+        if not pages:
+            log("no page target found for navigate; skipping")
+            return
+        ws = websocket.create_connection(
+            pages[0]["webSocketDebuggerUrl"], timeout=15, origin=""
+        )
+        try:
+            cdp_call(ws, 1, "Page.enable")
+            cdp_call(ws, 2, "Page.navigate", {"url": "https://www.youtube.com"})
+            log("reloaded YouTube page to activate imported cookies")
+        finally:
+            ws.close()
+    except Exception as exc:
+        log(f"navigate failed: {exc}")
+
+
+def maybe_import(cookies: list) -> bool:
+    """Plan A import phase. Returns True if the browser was re-seeded."""
+    global _last_import_attempt, _last_imported_fp
+    if _cookies_have_login(cookies):
+        return False  # live session: never overwrite with file values
+    if time.time() - _last_import_attempt < IMPORT_RETRY_S:
+        return False
+    if not os.path.exists(OUT_PATH):
+        return False
+    try:
+        file_fp = os.path.getmtime(OUT_PATH)
+    except OSError:
+        return False
+    if _last_imported_fp == file_fp:
+        return False  # already tried importing this exact file version
+    _last_import_attempt = time.time()
+    _last_imported_fp = file_fp
+    file_cookies = parse_netscape(OUT_PATH)
+    if not file_cookies:
+        log("browser logged out; cookies.txt empty/unreadable")
+        return False
+    if not _cookies_have_login(file_cookies):
+        log("browser logged out; cookies.txt has no valid YouTube login to import")
+        return False
+    ws = open_ws()
+    try:
+        cdp_call(ws, 1, "Storage.setCookies", {"cookies": file_cookies})
+    finally:
+        ws.close()
+    log(f"imported {len(file_cookies)} cookies from {OUT_PATH} into browser")
+    navigate_to_youtube()
+    return True
+
+
 def main() -> None:
     log(f"starting: cdp={CDP_HOST}:{CDP_PORT} out={OUT_PATH} poll={POLL_SECONDS}s")
     last_fp = None
@@ -124,11 +257,19 @@ def main() -> None:
         try:
             cookies = fetch_cookies()
             fp = cookie_fingerprint(cookies)
+            if maybe_import(cookies):
+                last_fp = None  # jar changed via import; re-export next cycle
+                time.sleep(POLL_SECONDS)
+                continue
             if fp != last_fp:
-                atomic_write(OUT_PATH, to_netscape(cookies))
-                yt = sum(1 for c in cookies if "youtube.com" in (c.get("domain") or ""))
-                log(f"cookies exported: {len(cookies)} total ({yt} youtube.com)")
-                last_fp = fp
+                mtime = os.path.getmtime(OUT_PATH) if os.path.exists(OUT_PATH) else 0
+                if time.time() - mtime < EXTERNAL_WRITE_COOLDOWN:
+                    log(f"file modified externally {int(time.time()-mtime)}s ago (yt-dlp write-back?) - holding off {EXTERNAL_WRITE_COOLDOWN - int(time.time()-mtime)}s")
+                else:
+                    atomic_write(OUT_PATH, to_netscape(cookies))
+                    yt = sum(1 for c in cookies if "youtube.com" in (c.get("domain") or ""))
+                    log(f"cookies exported: {len(cookies)} total ({yt} youtube.com)")
+                    last_fp = fp
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
             raise
