@@ -1,0 +1,9 @@
+[Interface]
+PrivateKey = __WG_PRIVATE_KEY__
+Address = __WG_ADDRESS__
+
+[Peer]
+PublicKey = __WG_PEER_PUBLIC_KEY__
+AllowedIPs = __WG_PEER_ALLOWEDIPS__
+Endpoint = __WG_PEER_ENDPOINT__
+PersistentKeepalive = __WG_PEER_PERSISTENT_KEEPALIVE__
