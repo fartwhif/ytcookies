@@ -27,6 +27,11 @@ mkdir -p /data/profile
 # new hostname) so Chromium doesn't refuse to start with a lock dialog.
 rm -f /data/profile/SingletonLock /data/profile/SingletonSocket /data/profile/SingletonCookie
 
+# Clear stale X display artifacts: Docker restarts reuse the container's
+# writable layer, so a leftover /tmp/.X99-lock makes Xvfb abort with
+# "Server is already active for display 99" and x11vnc then can't open :99.
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 /tmp/.X99-auth*
+
 # ── VNC password ───────────────────────────────────────────────────
 VNC_AUTH=""
 if [ -n "$VNC_PASSWORD" ]; then
