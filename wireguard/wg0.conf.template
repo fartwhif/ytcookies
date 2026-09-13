@@ -1,6 +1,17 @@
 [Interface]
 PrivateKey = __WG_PRIVATE_KEY__
 Address = __WG_ADDRESS__
+# WSL2 kernel (5.15.167.4-microsoft-standard) lacks the nf_conntrack_mark module,
+# so wg-quick's default CONNMARK rules (installed only when AllowedIPs is 0.0.0.0/0)
+# fail with "Extension CONNMARK revision 0 not supported, missing kernel module".
+# Pinning an explicit routing table makes wg-quick take the plain path
+# (ip route ... table 51820, no CONNMARK, no iptables). FwMark lets the kernel
+# mark tunnel packets natively; PostUp/PreDown manage the single ip rule that
+# wg-quick would have created itself.
+Table = 51820
+FwMark = 51820
+PostUp = ip rule add not fwmark 51820 table 51820
+PreDown = ip rule delete not fwmark 51820 table 51820
 
 [Peer]
 PublicKey = __WG_PEER_PUBLIC_KEY__
