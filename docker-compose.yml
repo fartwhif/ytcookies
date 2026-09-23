@@ -19,6 +19,7 @@ services:
       - .env
     networks:
       - ytcookies
+      - shared
 
 networks:
   ytcookies:
@@ -27,3 +28,5 @@ networks:
       config:
         # Must NOT overlap the WireGuard subnet 10.99.0.0/20
         - subnet: 172.33.0.0/16
+  shared:
+    external: true

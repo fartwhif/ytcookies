@@ -15,6 +15,12 @@ if [ -n "$WG_PRIVATE_KEY" ] && [ -n "$WG_PEER_PUBLIC_KEY" ] && [ -n "$WG_PEER_EN
     /etc/wireguard/wg0.conf.template > /etc/wireguard/wg0.conf
 
   wg-quick up wg0
+  # Keep the docker bridge subnet on eth0: full-tunnel WireGuard (table
+  # 51820) would otherwise route replies to the bridge gateway
+  # (docker-proxy's local end for host-mapped ports) via wg0 and drop them.
+  BRIDGE_NET=$(ip -4 route show table main | awk '/scope link/ {print $1; exit}')
+  [ -n "$BRIDGE_NET" ] && ip route replace ${BRIDGE_NET} dev eth0 table 51820 2>/dev/null || true
+
   echo "WireGuard tunnel established"
   wg show
 else
