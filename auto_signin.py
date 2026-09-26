@@ -25,6 +25,7 @@ Design constraints:
 import fcntl
 import json
 import os
+import re
 import random
 import time
 import urllib.request
@@ -50,6 +51,17 @@ SUCCESS_COOLDOWN = 300
 # a concurrent daemon + manual run interleaves keystrokes and burns strikes,
 # and the window also paces the strike count for the account.
 REENTRY_GUARD = 1800
+# Google's v3 sign-in flow is a server-side session with a ~20-min
+# lifetime; submitting a stale flow (staged long before the password is
+# typed) returns the generic "Something went wrong" page instead of a
+# real verdict. Re-open the flow before typing when its URL dsh stamp is
+# older than this.
+FLOW_MAX_AGE = int(os.environ.get("AUTO_SIGNIN_FLOW_MAX_AGE", "600"))
+# Total attempts per kill. Transient outcomes (RETRYABLE) are retried
+# with a fresh fuzzed delay; wrong_password / 2fa / challenge escalate to
+# a human immediately (retrying a wrong password just burns strikes).
+MAX_ATTEMPTS = int(os.environ.get("AUTO_SIGNIN_MAX_ATTEMPTS", "3"))
+RETRYABLE = ("error_page", "staging_failed", "vnc_type_failed", "vnc_unreachable")
 _DATA_DIR = os.path.dirname(SESSION_STATE_PATH) or "/"
 SIGNIN_LOCK = os.path.join(_DATA_DIR, "signin.lock")
 ATTEMPT_MARK = os.path.join(_DATA_DIR, "attempted.json")
@@ -368,18 +380,22 @@ def verify_result(ws, msg_id: int, pre_href: str, pre_text: str) -> str:
     return "staging_failed"
 
 
-def attempt_signin() -> str:
+def attempt_signin(bypass_reentry: bool = False) -> str:
     """Guarded entry: one live attempt at a time, none within
     REENTRY_GUARD seconds of the last one (prevents a concurrent daemon +
-    manual run from interleaving keystrokes and burning strikes)."""
-    try:
-        with open(ATTEMPT_MARK) as f:
-            last = float(json.load(f).get("at", 0))
-        if time.time() - last < REENTRY_GUARD:
-            log(f"attempt blocked: last attempt was {int(time.time() - last)}s ago")
-            return "recent_attempt"
-    except (OSError, ValueError, TypeError):
-        pass
+    manual run from interleaving keystrokes and burning strikes).
+    bypass_reentry is for the daemon's own scheduled retry of a transient
+    failure (no password was verified, so no strikes were burned); the
+    file lock still serializes attempts."""
+    if not bypass_reentry:
+        try:
+            with open(ATTEMPT_MARK) as f:
+                last = float(json.load(f).get("at", 0))
+            if time.time() - last < REENTRY_GUARD:
+                log(f"attempt blocked: last attempt was {int(time.time() - last)}s ago")
+                return "recent_attempt"
+        except (OSError, ValueError, TypeError):
+            pass
     lock_fh = open(SIGNIN_LOCK, "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -399,6 +415,85 @@ def attempt_signin() -> str:
         lock_fh.close()
 
 
+def _navigate_to_signin() -> bool:
+    """Open the sign-in flow like a person: focus the address bar
+    (Ctrl+L), type the URL, hit Enter. A real navigation (normal referrer
+    chain) instead of a CDP Page.navigate (empty referrer is a bot
+    signal)."""
+    ok, _ = vnc_request("/combo", {"mod": "ctrl", "key": "l"})
+    if not ok:
+        return False
+    time.sleep(random.uniform(0.5, 1.2))  # let the omnibox take focus
+    ok, _ = vnc_request("/type", {"text": "https://www.youtube.com/signin\n"})
+    if not ok:
+        return False
+    time.sleep(random.uniform(3.0, 7.0))  # let the page load; read it
+    return True
+
+
+def flow_age(ws, mid: int) -> tuple[float | None, int]:
+    """Age in seconds of the current v3 sign-in flow, read from the URL's
+    dsh=<server>:<usec> stamp (percent-encoded or bare). (None, mid) when
+    the stamp is absent or undecodable."""
+    href = str(_eval(ws, mid, "location.href") or "")
+    mid += 1
+    m = re.search(r"dsh=[^&]*?(?:%3A|:)(\d{15,})", href)
+    if not m:
+        return None, mid
+    age = time.time() - int(m.group(1)) / 1e6
+    return (age if age >= 0 else None), mid
+
+
+def _stage_to_password(ws, mid: int) -> tuple[str, int, str]:
+    """Drive the flow to the password step, typing as a person would.
+    Returns (outcome, mid, last_stage); outcome is 'password',
+    'vnc_unreachable', or 'staging_failed' (loop exhausted / rect
+    missing)."""
+    stage = "no target yet"
+    for _ in range(30):
+        stage = str(_eval(ws, mid, _stage_js()) or "no target yet")
+        mid += 1
+        if stage == "password step ready":
+            return "password", mid, stage
+        if stage == "email field ready":
+            cur = str(_eval(ws, mid, _EMAIL_FIELD_JS + ".value") or "")
+            mid += 1
+            time.sleep(random.uniform(2.0, 5.0))  # read the page
+            if cur != EMAIL:
+                email_center = _screen_center(_eval(ws, mid, _EMAIL_RECT_JS))
+                mid += 1
+                if not email_center:
+                    log("email field rect not found")
+                    return "staging_failed", mid, stage
+                ok, _ = vnc_request("/click", {"x": email_center[0], "y": email_center[1]})
+                if not ok:
+                    return "vnc_unreachable", mid, stage
+                if cur:  # stale/prefilled value: genuine select-all + Delete
+                    ok, _ = vnc_request("/clear")
+                    if not ok:
+                        return "vnc_unreachable", mid, stage
+                    time.sleep(random.uniform(0.4, 0.9))
+                ok, _ = vnc_request("/type", {"text": EMAIL})
+                if not ok:
+                    return "vnc_unreachable", mid, stage
+                time.sleep(random.uniform(1.5, 4.0))  # look at the typed email
+            next_center = _screen_center(_eval(ws, mid, _NEXT_RECT_JS))
+            mid += 1
+            if not next_center:
+                log("Next button rect not found")
+                return "staging_failed", mid, stage
+            ok, _ = vnc_request("/click", {"x": next_center[0], "y": next_center[1]})
+            if not ok:
+                return "vnc_unreachable", mid, stage
+            time.sleep(random.uniform(3.0, 6.0))  # let the flow advance
+            continue
+        if stage in ("account selected", "restart clicked"):
+            time.sleep(random.uniform(2.0, 5.0))  # let the next step load
+            continue
+        time.sleep(random.uniform(2.0, 4.0))  # no target yet
+    return "staging_failed", mid, stage
+
+
 def _do_attempt() -> str:
     """One full email -> password attempt, paced like a person filling
     out the form. Returns an outcome string."""
@@ -411,65 +506,30 @@ def _do_attempt() -> str:
         href = str(_eval(ws, mid, "location.href") or "")
         mid += 1
         if "accounts.google.com" not in href:
-            # Navigate like a person: focus the address bar (Ctrl+L),
-            # type the URL, hit Enter. A real navigation (normal referrer
-            # chain) instead of a CDP Page.navigate (empty referrer is a
-            # bot signal).
-            ok, _ = vnc_request("/combo", {"mod": "ctrl", "key": "l"})
-            if not ok:
+            if not _navigate_to_signin():
                 return "vnc_unreachable"
-            time.sleep(random.uniform(0.5, 1.2))  # let the omnibox take focus
-            ok, _ = vnc_request("/type", {"text": "https://www.youtube.com/signin\n"})
-            if not ok:
-                return "vnc_unreachable"
-            time.sleep(random.uniform(3.0, 7.0))  # let the page load; read it
-        # Drive the flow to the password step, typing as a person would.
-        at_password = False
-        for _ in range(30):
-            stage = str(_eval(ws, mid, _stage_js()) or "no target yet")
-            mid += 1
-            if stage == "password step ready":
-                at_password = True
-                break
-            if stage == "email field ready":
-                cur = str(_eval(ws, mid, _EMAIL_FIELD_JS + ".value") or "")
-                mid += 1
-                time.sleep(random.uniform(2.0, 5.0))  # read the page
-                if cur != EMAIL:
-                    email_center = _screen_center(_eval(ws, mid, _EMAIL_RECT_JS))
-                    mid += 1
-                    if not email_center:
-                        log("email field rect not found")
-                        return "staging_failed"
-                    ok, _ = vnc_request("/click", {"x": email_center[0], "y": email_center[1]})
-                    if not ok:
-                        return "vnc_unreachable"
-                    if cur:  # stale/prefilled value: genuine select-all + Delete
-                        ok, _ = vnc_request("/clear")
-                        if not ok:
-                            return "vnc_unreachable"
-                        time.sleep(random.uniform(0.4, 0.9))
-                    ok, _ = vnc_request("/type", {"text": EMAIL})
-                    if not ok:
-                        return "vnc_unreachable"
-                    time.sleep(random.uniform(1.5, 4.0))  # look at the typed email
-                next_center = _screen_center(_eval(ws, mid, _NEXT_RECT_JS))
-                mid += 1
-                if not next_center:
-                    log("Next button rect not found")
-                    return "staging_failed"
-                ok, _ = vnc_request("/click", {"x": next_center[0], "y": next_center[1]})
-                if not ok:
-                    return "vnc_unreachable"
-                time.sleep(random.uniform(3.0, 6.0))  # let the flow advance
-                continue
-            if stage in ("account selected", "restart clicked"):
-                time.sleep(random.uniform(2.0, 5.0))  # let the next step load
-                continue
-            time.sleep(random.uniform(2.0, 4.0))  # no target yet
-        if not at_password:
+        outcome, mid, stage = _stage_to_password(ws, mid)
+        if outcome == "vnc_unreachable":
+            return "vnc_unreachable"
+        if outcome != "password":
             log(f"staging ended at '{stage}'")
             return classify_page(ws, mid)
+        # The v3 flow is a server-side session with a ~20-min lifetime;
+        # the exporter may have staged this page minutes ago. Submitting
+        # into a stale flow returns the generic "Something went wrong"
+        # page instead of a real verdict, so re-open the flow right
+        # before typing when it is older than FLOW_MAX_AGE.
+        age, mid = flow_age(ws, mid)
+        if age is not None and age > FLOW_MAX_AGE:
+            log(f"flow is {int(age)}s old (> {FLOW_MAX_AGE}s); re-opening before typing")
+            if not _navigate_to_signin():
+                return "vnc_unreachable"
+            outcome, mid, stage = _stage_to_password(ws, mid)
+            if outcome == "vnc_unreachable":
+                return "vnc_unreachable"
+            if outcome != "password":
+                log(f"staging after fresh flow ended at '{stage}'")
+                return classify_page(ws, mid)
         time.sleep(random.uniform(3.0, 7.0))  # read the password page
         # Password via the VNC sibling as real keystrokes - NOT CDP synthetic
         # events and NOT a clipboard paste: Google rejects both as
@@ -550,9 +610,13 @@ def main() -> None:
     if not PASSWORD:
         log("GOOGLE_PASSWORD not set; not running")
         return
-    log(f"starting: cdp={CDP_HOST}:{CDP_PORT} delay={DELAY_MIN}-{DELAY_MAX}s")
+    log(
+        f"starting: cdp={CDP_HOST}:{CDP_PORT} delay={DELAY_MIN}-{DELAY_MAX}s "
+        f"flow_max_age={FLOW_MAX_AGE}s max_attempts={MAX_ATTEMPTS}"
+    )
     last_state: str | None = None
     human_needed = False
+    attempts = 0
     resume_at = 0.0
 
     while True:
@@ -561,26 +625,36 @@ def main() -> None:
             if state == "down":
                 if last_state != "down":
                     human_needed = False
+                    attempts = 0
                     log("session down; arming auto re-auth")
                 if not human_needed and time.time() >= resume_at:
                     delay = fuzz(DELAY_MIN, DELAY_MAX)
-                    log(
-                        f"typing credentials in {delay // 60}m{delay % 60:02d}s (fuzzed)"
-                    )
+                    if attempts:
+                        log(
+                            f"retry {attempts}/{MAX_ATTEMPTS - 1}: typing credentials "
+                            f"in {delay // 60}m{delay % 60:02d}s (fuzzed)"
+                        )
+                    else:
+                        log(
+                            f"typing credentials in {delay // 60}m{delay % 60:02d}s (fuzzed)"
+                        )
                     still_down = sleep_fuzzed(delay, lambda: read_state() != "down")
                     if still_down:
-                        outcome = attempt_signin()
+                        outcome = attempt_signin(bypass_reentry=attempts > 0)
                         log(f"outcome: {outcome}")
                         if outcome == "success":
                             resume_at = time.time() + SUCCESS_COOLDOWN
+                            attempts = 0
+                        elif outcome in RETRYABLE and attempts + 1 < MAX_ATTEMPTS:
+                            attempts += 1
                         else:
                             human_needed = True
                             if outcome not in ("recent_attempt", "busy"):
                                 notify(
                                     "manual re-auth needed",
                                     f"auto sign-in could not restore the session "
-                                    f"({outcome}); sign in via noVNC "
-                                    "(ytcookies.example.com)",
+                                    f"({outcome}) after {attempts + 1} attempt(s); "
+                                    "sign in via noVNC (ytcookies.example.com)",
                                 )
             else:
                 human_needed = False

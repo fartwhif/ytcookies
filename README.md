@@ -61,6 +61,8 @@ Env vars (all optional):
 - `GRABBY_API_URL` — GrabbyTube API for UA sync (default `http://grabbytube:8101`)
 - `GOOGLE_PASSWORD` — account password; when set the entrypoint starts the auto sign-in daemon (below)
 - `AUTO_SIGNIN_DELAY_MIN` / `AUTO_SIGNIN_DELAY_MAX` — fuzzed pre-typing delay window, seconds (default 240–1500)
+- `AUTO_SIGNIN_FLOW_MAX_AGE` — max age (seconds) of the sign-in flow before the daemon re-opens it before typing (default 600); Google v3 flows expire server-side after ~20 min and a stale flow fails with a generic error page
+- `AUTO_SIGNIN_MAX_ATTEMPTS` — total attempts per kill before escalating to manual re-auth (default 3); only transient failures are retried
 
 ## Auto sign-in
 
@@ -74,11 +76,20 @@ rhythm, and checks the result:
 - **session restored** — the tab parks on about:blank and the exporter
   reseeds the cookie file from the fresh browser jar within ~30s →
   `SESSION UP`.
-- **anything else** (2FA / verification challenge, captcha, wrong
-  password, page-flow change) — the daemon stops, pushes
-  `manual re-auth needed` to ntfy, and waits. Sign in via noVNC as
-  before; when the session is up again the daemon re-arms for the
-  next kill.
+- **anything transient** (flow error page, page-flow change, dropped
+  keystrokes, VNC hiccup) — the daemon waits another fuzzed window and
+  retries, up to `AUTO_SIGNIN_MAX_ATTEMPTS` attempts in total.
+- **needs a human** (2FA / verification challenge, captcha, wrong
+  password) — the daemon stops, pushes `manual re-auth needed` to ntfy,
+  and waits. Sign in via noVNC as before; when the session is up again
+  the daemon re-arms for the next kill.
+
+Before typing, the daemon checks the flow's age from the URL's `dsh`
+stamp: a Google v3 sign-in flow is a server-side session that dies after
+~20 min, and a password submitted to a stale flow fails with the generic
+"Something went wrong" page. A flow older than `AUTO_SIGNIN_FLOW_MAX_AGE`
+is re-opened (fresh navigation + re-stage) so the password always lands
+in a fresh flow.
 
 The daemon never touches the cookie file — the exporter stays the single
 source of truth. All timing (pre-typing delay, keystroke rhythm) is
