@@ -10,6 +10,8 @@ services:
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv4.ip_forward=1
+    dns:
+      - 10.99.0.42
     ports:
       - "8300:8300"
     volumes:
@@ -17,8 +19,29 @@ services:
       - /lib/modules:/lib/modules:ro
     env_file:
       - .env
+    environment:
+      # ytcookies' WireGuard full tunnel (AllowedIPs 0.0.0.0/0) diverts every
+      # outbound route except the shared bridge (172.19.0.0/16) into the tunnel,
+      # so the sibling lives on `shared` and is reached by service name there.
+      - VNC_DRIVER_URL=http://vncdriver:8123
     networks:
       - ytcookies
+      - shared
+
+  vncdriver:
+    build:
+      context: .
+      dockerfile: vncdriver/Dockerfile
+    container_name: vncdriver
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Both the guest and this sibling sit on the shared bridge, so the RFB
+      # stream is reached directly by service name (L2, no host-gateway DNAT
+      # hop, unaffected by the guest's WireGuard full tunnel).
+      - VNC_WS_URL=ws://ytcookies:8300/websock
+    networks:
       - shared
 
 networks:

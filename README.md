@@ -59,6 +59,30 @@ Env vars (all optional):
 - `GOOGLE_EMAIL` — account shown in the sign-in chooser; the exporter clicks it when the session dies
 - `DRIVEPOD_API_URL` — DrivePod backend for UA sync (default `http://drivepod:3000` on the docker `shared` network)
 - `GRABBY_API_URL` — GrabbyTube API for UA sync (default `http://grabbytube:8101`)
+- `GOOGLE_PASSWORD` — account password; when set the entrypoint starts the auto sign-in daemon (below)
+- `AUTO_SIGNIN_DELAY_MIN` / `AUTO_SIGNIN_DELAY_MAX` — fuzzed pre-typing delay window, seconds (default 240–1500)
+
+## Auto sign-in
+
+When `GOOGLE_PASSWORD` is set, the entrypoint starts a second background
+daemon (`auto_signin.py`) next to the exporter. While the state file
+says `down` it waits a fuzzed 4–25 min (skewed short), then types the
+account email and password into the sign-in flow as real VNC keystrokes
+(sibling `vncdriver` RFB client; CDP stays read-only) at a human typing
+rhythm, and checks the result:
+
+- **session restored** — the tab parks on about:blank and the exporter
+  reseeds the cookie file from the fresh browser jar within ~30s →
+  `SESSION UP`.
+- **anything else** (2FA / verification challenge, captcha, wrong
+  password, page-flow change) — the daemon stops, pushes
+  `manual re-auth needed` to ntfy, and waits. Sign in via noVNC as
+  before; when the session is up again the daemon re-arms for the
+  next kill.
+
+The daemon never touches the cookie file — the exporter stays the single
+source of truth. All timing (pre-typing delay, keystroke rhythm) is
+fuzzed so the re-auth does not look machine-paced.
 
 ## Access
 - https://ytcookies.example.com  -> noVNC, password is VNC_PASSWORD in .env

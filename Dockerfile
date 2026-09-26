@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir --break-system-packages websocket-client
 
 COPY cookie_exporter.py /app/cookie_exporter.py
+COPY auto_signin.py /app/auto_signin.py
 COPY entrypoint.sh /app/entrypoint.sh
 COPY wireguard/wg0.conf.template /etc/wireguard/wg0.conf.template
 RUN chmod +x /app/entrypoint.sh

@@ -55,6 +55,9 @@ NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
 # Google account email; prefilled/clicked on the sign-in page when the
 # session dies.
 GOOGLE_EMAIL = os.environ.get("GOOGLE_EMAIL", "").strip()
+# The auto re-auth daemon (auto_signin.py) is started by the entrypoint
+# when the password is configured; the death notification reflects that.
+AUTO_SIGNIN = bool(os.environ.get("GOOGLE_PASSWORD", "").strip())
 
 # The consumer services must present the SAME user agent as the browser that
 # created the session (a mismatched UA on the same session is a kill signal).
@@ -289,8 +292,17 @@ def _export_if_ok(cookies: list, reason: str) -> bool:
 
 _STAGE_JS = """
 (function(){
+  const vis = x => !!(x && (x.offsetWidth || x.offsetHeight || x.getClientRects().length));
+  if (/something went wrong/i.test(document.body ? document.body.innerText : '')) {
+    const btn = [...document.querySelectorAll('button')].find(b =>
+      (b.innerText || '').trim() === 'Restart' && vis(b));
+    if (btn) { btn.click(); return 'restart clicked'; }
+  }
+  // The v3 flow keeps a hidden input[name=hiddenPassword] on the
+  // identifier page, so only a VISIBLE password field means the flow
+  // has actually reached the password step.
+  if ([...document.querySelectorAll('input[type=password]')].some(vis)) return 'password step ready';
   const email = __EMAIL__;
-  if (document.querySelector('input[type=password]')) return 'password step ready';
   if (email) {
     const all = [...document.querySelectorAll('*')];
     const leaves = all.filter(
@@ -304,14 +316,17 @@ _STAGE_JS = """
     }
     if (el && el !== document.body) { el.click(); return 'account selected'; }
   }
-  const i = document.querySelector('input[type=email]');
-  if (i) {
+  const i = document.querySelector('input[name=identifier]') || document.querySelector('#identifierId');
+  if (i && vis(i)) {
     const s = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value'
     ).set;
     s.call(i, email);
     i.dispatchEvent(new Event('input', {bubbles: true}));
     i.focus();
+    // Deliberately NOT clicking Next: the submit is the Google-visible
+    // step and is paced like a person by the auto sign-in daemon (or a
+    // human via noVNC).
     return i.value === email ? 'email prefilled' : 'prefill rejected';
   }
   return 'no target yet';
@@ -337,8 +352,8 @@ def _stage_poll(ws, expr: str, msg_id: int = 10) -> str:
         )
         msg_id += 1
         result = str((res.get("result") or {}).get("value") or "no target yet")
-        if result == "account selected":
-            time.sleep(3)  # let the password step load
+        if result in ("account selected", "restart clicked"):
+            time.sleep(4)  # let the password step load
             res = cdp_call(
                 ws,
                 msg_id,
@@ -347,7 +362,7 @@ def _stage_poll(ws, expr: str, msg_id: int = 10) -> str:
             )
             msg_id += 1
             after = str((res.get("result") or {}).get("value") or "")
-            return f"account selected -> {after}"
+            return f"{result} -> {after}"
         if result != "no target yet":
             return result
     return "no target yet"
@@ -687,11 +702,18 @@ def main() -> None:
                             f"SESSION DEAD (file session killed; "
                             f"was '{state}' since {since} UTC)"
                         )
-                        notify(
-                            "session_dead",
-                            "cookie file session killed by Google; re-sign in "
-                            "via noVNC (ytcookies.example.com)",
-                        )
+                        if AUTO_SIGNIN:
+                            detail = (
+                                "cookie file session killed by Google; auto "
+                                "re-auth in progress (manual fallback: noVNC "
+                                "ytcookies.example.com)"
+                            )
+                        else:
+                            detail = (
+                                "cookie file session killed by Google; re-sign "
+                                "in via noVNC (ytcookies.example.com)"
+                            )
+                        notify("session_dead", detail)
                         state, state_since = "down", time.time()
                     if cookies is not None:
                         if jar_login and _export_if_ok(

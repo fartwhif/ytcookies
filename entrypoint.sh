@@ -15,11 +15,16 @@ if [ -n "$WG_PRIVATE_KEY" ] && [ -n "$WG_PEER_PUBLIC_KEY" ] && [ -n "$WG_PEER_EN
     /etc/wireguard/wg0.conf.template > /etc/wireguard/wg0.conf
 
   wg-quick up wg0
-  # Keep the docker bridge subnet on eth0: full-tunnel WireGuard (table
-  # 51820) would otherwise route replies to the bridge gateway
-  # (docker-proxy's local end for host-mapped ports) via wg0 and drop them.
-  BRIDGE_NET=$(ip -4 route show table main | awk '/scope link/ {print $1; exit}')
-  [ -n "$BRIDGE_NET" ] && ip route replace ${BRIDGE_NET} dev eth0 table 51820 2>/dev/null || true
+  # Keep every locally-connected docker bridge subnet out of the full-tunnel
+  # WireGuard route (table 51820): otherwise traffic to the sibling container
+  # (on the shared bridge) and the bridge gateways would be diverted into the
+  # tunnel and dropped. Interface names are NOT stable across container
+  # recreates, so copy each connected route's actual device instead of
+  # assuming eth0.
+  ip -4 route show table main | awk '/scope link/ {print $1, $3}' | \
+    while read -r net dev; do
+      ip route replace "${net}" dev "${dev}" table 51820 2>/dev/null || true
+    done
 
   echo "WireGuard tunnel established"
   wg show
@@ -81,6 +86,14 @@ chromium \
   --disable-features=Translate \
   --lang=en-US \
   "https://www.youtube.com" &
+
+# ── Auto sign-in daemon (background) ──────────────────────────────
+# Completes re-auth when the session dies: fuzzed human-like delay,
+# then types email + password via CDP. Never touches the cookie file.
+if [ -n "$GOOGLE_PASSWORD" ]; then
+  echo "auto sign-in: enabled (delay ${AUTO_SIGNIN_DELAY_MIN:-240}-${AUTO_SIGNIN_DELAY_MAX:-1500}s)"
+  python3 /app/auto_signin.py &
+fi
 
 # ── Cookie exporter (main process) ────────────────────────────────
 exec python3 /app/cookie_exporter.py
