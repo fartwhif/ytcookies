@@ -293,6 +293,26 @@ def _export_if_ok(cookies: list, reason: str) -> bool:
 _STAGE_JS = """
 (function(){
   const vis = x => !!(x && (x.offsetWidth || x.offsetHeight || x.getClientRects().length));
+  // Post-verification onboarding cards (gds.google.com: "Make sure you
+  // can always sign in", "Set a home address", ...): the sign-in is
+  // already authenticated but the flow is held at these sticky cards;
+  // dismissing each via its skip/cancel button is the only way forward
+  // (the auto sign-in daemon does the same with a real pointer click).
+  // Match 'button'/'a' only: role=button elements on these cards include
+  // material-icon ligatures whose innerText is 'cancel' (the input-clear
+  // icon), which would be the wrong target.
+  if (location.href.indexOf('gds.google.com') !== -1 &&
+      location.href.indexOf('continue=') !== -1) {
+    const words = ['cancel', 'skip', 'not now', 'no thanks', 'later'];
+    const btn = [...document.querySelectorAll('button, a')].find(b => {
+      if (!vis(b)) return false;
+      const t = (b.innerText||'').trim().toLowerCase();
+      const a = (b.getAttribute('aria-label')||'').trim().toLowerCase();
+      return words.includes(t) || words.includes(a);
+    });
+    if (btn) { btn.click(); return 'gds card dismissed'; }
+    return 'gds card stuck';
+  }
   if (/something went wrong/i.test(document.body ? document.body.innerText : '')) {
     const btn = [...document.querySelectorAll('button')].find(b =>
       (b.innerText || '').trim() === 'Restart' && vis(b));
@@ -352,6 +372,11 @@ def _stage_poll(ws, expr: str, msg_id: int = 10) -> str:
         )
         msg_id += 1
         result = str((res.get("result") or {}).get("value") or "no target yet")
+        if result == "gds card dismissed":
+            time.sleep(4)  # let the next card / step load
+            continue
+        if result == "gds card stuck":
+            return "gds card stuck"
         if result in ("account selected", "restart clicked"):
             time.sleep(4)  # let the password step load
             res = cdp_call(
@@ -402,9 +427,12 @@ def prepare_resignin() -> None:
     """Bring the visible tab as close to the password step as possible so
     manual re-auth is just typing the password. Never disturbs a tab already
     at the password step. Handles the account chooser (clicks the remembered
-    account) and the identifier page (prefills the email). If the flow is
-    walled off by Google's CookieMismatch / session-expired page, clears the
-    vault and retries once."""
+    account) and the identifier page (prefills the email). Dismisses
+    post-verification onboarding cards (gds.google.com: recovery phone, home
+    address, ...) by clicking their skip/cancel button — those cards are
+    sticky and hold an already-authenticated sign-in until skipped. If the
+    flow is walled off by Google's CookieMismatch / session-expired page,
+    clears the vault and retries once."""
     try:
         targets = http_json(f"http://{CDP_HOST}:{CDP_PORT}/json")
         pages = [t for t in targets if t.get("type") == "page"]
@@ -421,7 +449,12 @@ def prepare_resignin() -> None:
                 {"expression": "location.href", "returnByValue": True},
             )
             cur = str((cur.get("result") or {}).get("value") or "")
-            if "accounts.google.com" not in cur:
+            h = cur.lower()
+            if "gds.google.com" in h and "continue=" in h:
+                # Onboarding cards are sticky: navigating away bounces
+                # straight back to the card; the stage poll dismisses them.
+                pass
+            elif "accounts.google.com" not in cur:
                 cdp_call(ws, 2, "Page.enable")
                 cdp_call(ws, 3, "Page.navigate", {"url": "https://www.youtube.com/signin"})
             expr = _stage_js()

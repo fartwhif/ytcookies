@@ -271,6 +271,35 @@ _NEXT_RECT_JS = """
 })()
 """
 
+# Post-verification onboarding cards. After a successful password check,
+# Google can hold the (already authenticated) flow at a run of
+# gds.google.com cards — "Make sure you can always sign in" (recovery
+# phone/email), "Set a home address", ... — each dismissable via a
+# skip/cancel button. The cards are sticky: navigating away (even to
+# /signin) bounces straight back to the card, so the button is the only
+# way through. The sign-in completes only after the last card is
+# dismissed and the flow's continue= target is reached.
+GDS_SKIP_WORDS = ("cancel", "skip", "not now", "no thanks", "later")
+
+# Screen-space rect of the visible skip/cancel button on the current
+# gds onboarding card (same shape as _NEXT_RECT_JS for _screen_center).
+_GDS_SKIP_RECT_JS = """
+(function(){
+  const vis = x => !!(x && (x.offsetWidth || x.offsetHeight || x.getClientRects().length));
+  const words = new Set(%s);
+  const btn = [...document.querySelectorAll('button, a')].find(b => {
+    if (!vis(b)) return false;
+    const t = (b.innerText || '').trim().toLowerCase();
+    const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+    return words.has(t) || words.has(a);
+  });
+  if (!btn) return null;
+  const b = btn.getBoundingClientRect();
+  return JSON.stringify({left:b.left, top:b.top, width:b.width, height:b.height,
+    innerH: window.innerHeight, outerH: window.outerHeight});
+})()
+""" % json.dumps(list(GDS_SKIP_WORDS))
+
 _STATE_JS = """
 JSON.stringify({
   href: location.href,
@@ -288,6 +317,43 @@ CHALLENGE_MARKERS = (
     "verify it's you",
     "unusual activity",
 )
+
+
+def _is_gds_card(href: str) -> bool:
+    """A gds.google.com onboarding card: an interstitial holding a sign-in
+    flow (always carries the continue= target of the pending auth)."""
+    h = (href or "").lower()
+    return "gds.google.com" in h and "continue=" in h
+
+
+def _dismiss_gds_card(ws, mid: int) -> tuple[str, int]:
+    """Click the skip/cancel button of the onboarding card on screen (real
+    pointer via vncdriver, like every other button in this flow). Returns
+    ('clicked' | 'no_button' | 'vnc_unreachable', mid)."""
+    rect_raw = _eval(ws, mid, _GDS_SKIP_RECT_JS)
+    mid += 1
+    center = _screen_center(rect_raw)
+    if not center:
+        return "no_button", mid
+    ok, _ = vnc_request("/click", {"x": center[0], "y": center[1]})
+    return ("clicked" if ok else "vnc_unreachable"), mid
+
+
+def _youtube_signed_in(ws, mid: int, href: str) -> tuple[bool, int]:
+    """A YouTube destination page with no visible 'Sign in' button: the
+    session is live in the browser (the flow completed outside this
+    attempt's typing — the last card just landed, or a human signed in
+    via noVNC while the state file was still 'down')."""
+    if not href.startswith(("https://www.youtube.com", "https://m.youtube.com")):
+        return False, mid
+    js = (
+        "(function(){if(document.readyState!=='complete')return false;"
+        "const vis=x=>!!(x&&(x.offsetWidth||x.offsetHeight||"
+        "x.getClientRects().length));return [...document.querySelectorAll("
+        "'button, a')].some(b=>(b.innerText||'').trim().toLowerCase()==="
+        "'sign in'&&vis(b));})()"
+    )
+    return not bool(_eval(ws, mid, js)), mid + 1
 
 
 def find_page() -> dict | None:
@@ -345,12 +411,27 @@ def verify_result(ws, msg_id: int, pre_href: str, pre_text: str) -> str:
     text are both unchanged, any 'Wrong password' text on screen belongs to
     a *previous* attempt and must not be classified as this submission's
     result.
+    Post-verification onboarding cards (gds.google.com) can appear between
+    the password check and the destination; each is dismissed via its
+    skip/cancel button (see _dismiss_gds_card) and the watch continues.
     """
     for _ in range(60):
         time.sleep(2)
         info = _page_state(ws, msg_id)
         msg_id += 1
         href = info.get("href") or ""
+        if _is_gds_card(href):
+            # The sign-in is authenticated but the flow is held at this
+            # onboarding card until it is skipped. Dismiss it and keep
+            # watching for the flow to reach the destination.
+            res, msg_id = _dismiss_gds_card(ws, msg_id)
+            if res == "vnc_unreachable":
+                return "vnc_unreachable"
+            if res == "no_button":
+                log(f"gds card has no dismiss button: {href[:200]}")
+                return "staging_failed"
+            log(f"dismissed gds onboarding card ({href.split('?')[0]})")
+            continue
         if "accounts.google.com" not in href:
             return "success"
         text_raw = info.get("text") or ""
@@ -431,6 +512,19 @@ def _navigate_to_signin() -> bool:
     return True
 
 
+def _park_tab_blank() -> None:
+    """Park the tab on about:blank using the same VNC omnibox navigation as
+    above (real keystrokes; owner's call): a live YouTube page keeps
+    rotating the browser's cookie copy, while the file — owned by the
+    yt-dlp services — is the live session. Keep the vault's tab inert."""
+    time.sleep(random.uniform(3.0, 6.0))  # let the post-login settle
+    ok, _ = vnc_request("/combo", {"mod": "ctrl", "key": "l"})
+    if ok:
+        time.sleep(random.uniform(0.5, 1.2))  # let the omnibox take focus
+        ok, _ = vnc_request("/type", {"text": "about:blank\n"})
+    log(f"parked tab on about:blank (ok={ok})")
+
+
 def flow_age(ws, mid: int) -> tuple[float | None, int]:
     """Age in seconds of the current v3 sign-in flow, read from the URL's
     dsh=<server>:<usec> stamp (percent-encoded or bare). (None, mid) when
@@ -447,10 +541,34 @@ def flow_age(ws, mid: int) -> tuple[float | None, int]:
 def _stage_to_password(ws, mid: int) -> tuple[str, int, str]:
     """Drive the flow to the password step, typing as a person would.
     Returns (outcome, mid, last_stage); outcome is 'password',
-    'vnc_unreachable', or 'staging_failed' (loop exhausted / rect
-    missing)."""
+    'signed in' (the flow completed without this attempt's typing),
+    'vnc_unreachable', or 'staging_failed' (loop exhausted / rect missing /
+    an onboarding card without a dismiss button)."""
     stage = "no target yet"
     for _ in range(30):
+        # Where is the flow right now?
+        href = str(_eval(ws, mid, "location.href") or "")
+        mid += 1
+        if "accounts.google.com" not in href:
+            if _is_gds_card(href):
+                # The sign-in is authenticated but held at a sticky
+                # onboarding card; only its skip/cancel advances it
+                # (navigating away bounces straight back to the card).
+                res, mid = _dismiss_gds_card(ws, mid)
+                if res == "vnc_unreachable":
+                    return "vnc_unreachable", mid, stage
+                if res == "no_button":
+                    log(f"gds card has no dismiss button: {href[:200]}")
+                    return "staging_failed", mid, stage
+                log(f"dismissed gds onboarding card ({href.split('?')[0]})")
+                time.sleep(random.uniform(2.0, 5.0))  # let the flow advance
+                continue
+            signed_in, mid = _youtube_signed_in(ws, mid, href)
+            if signed_in:
+                # The flow completed while we were staging (the last card
+                # just landed, or a human signed in via noVNC): the session
+                # is live in the browser; report it, don't type.
+                return "signed in", mid, href
         stage = str(_eval(ws, mid, _stage_js()) or "no target yet")
         mid += 1
         if stage == "password step ready":
@@ -506,11 +624,19 @@ def _do_attempt() -> str:
         href = str(_eval(ws, mid, "location.href") or "")
         mid += 1
         if "accounts.google.com" not in href:
-            if not _navigate_to_signin():
+            if _is_gds_card(href):
+                # The onboarding cards are sticky: navigating away bounces
+                # straight back to the card; staging dismisses them.
+                pass
+            elif not _navigate_to_signin():
                 return "vnc_unreachable"
         outcome, mid, stage = _stage_to_password(ws, mid)
         if outcome == "vnc_unreachable":
             return "vnc_unreachable"
+        if outcome == "signed in":
+            log(f"sign-in already complete (tab at {href[:120]})")
+            _park_tab_blank()
+            return "success"
         if outcome != "password":
             log(f"staging ended at '{stage}'")
             return classify_page(ws, mid)
@@ -527,6 +653,10 @@ def _do_attempt() -> str:
             outcome, mid, stage = _stage_to_password(ws, mid)
             if outcome == "vnc_unreachable":
                 return "vnc_unreachable"
+            if outcome == "signed in":
+                log(f"sign-in already complete (tab at {href[:120]})")
+                _park_tab_blank()
+                return "success"
             if outcome != "password":
                 log(f"staging after fresh flow ended at '{stage}'")
                 return classify_page(ws, mid)
@@ -590,17 +720,7 @@ def _do_attempt() -> str:
             return "vnc_unreachable"
         outcome = verify_result(ws, mid, pre_href, pre_text)
         if outcome == "success":
-            # Park the tab on about:blank using the same VNC omnibox
-            # navigation as above (real keystrokes; owner's call): a live
-            # YouTube page keeps rotating the browser's cookie copy, while
-            # the file — owned by the yt-dlp services — is the live
-            # session. Keep the vault's tab inert.
-            time.sleep(random.uniform(3.0, 6.0))  # let the post-login settle
-            ok, _ = vnc_request("/combo", {"mod": "ctrl", "key": "l"})
-            if ok:
-                time.sleep(random.uniform(0.5, 1.2))  # let the omnibox take focus
-                ok, _ = vnc_request("/type", {"text": "about:blank\n"})
-            log(f"parked tab on about:blank after successful login (ok={ok})")
+            _park_tab_blank()
         return outcome
     finally:
         ws.close()

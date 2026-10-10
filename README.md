@@ -25,7 +25,8 @@ GET https://www.youtube.com/account with the file's cookies. Live -> the
 account page; killed -> 30x to accounts.google.com. No browser traffic is
 involved. On death it logs `SESSION DEAD`, pushes a notification (if
 configured), and pre-stages the sign-in page as far as possible (clicks the
-remembered account or prefills the email) so re-auth is just typing the
+remembered account, prefills the email, dismisses onboarding cards) so
+re-auth is just typing the
 password. When you sign in via noVNC, the exporter seeds the dead file from
 the browser jar within ~30s and confirms liveness -> `SESSION UP` +
 notification. If the browser profile ever loses its login while the file is
@@ -90,6 +91,18 @@ stamp: a Google v3 sign-in flow is a server-side session that dies after
 "Something went wrong" page. A flow older than `AUTO_SIGNIN_FLOW_MAX_AGE`
 is re-opened (fresh navigation + re-stage) so the password always lands
 in a fresh flow.
+
+After a successful password check, Google can hold the (already
+authenticated) flow at post-verification onboarding cards
+(`gds.google.com`: "Make sure you can always sign in" — add a recovery
+phone/email — "Set a home address", ...). The cards are sticky: navigating
+away bounces straight back to the card, and they block a sign-in that has
+already passed the password check. The daemon therefore clicks each card's
+skip/cancel button (real pointer, like everything else) until the flow
+reaches the destination — both while staging and while watching the result;
+the exporter's pre-staging does the same with CDP clicks. A card without a
+recognizable skip button is a transient failure (retried, then escalated
+like any other).
 
 The daemon never touches the cookie file — the exporter stays the single
 source of truth. All timing (pre-typing delay, keystroke rhythm) is
