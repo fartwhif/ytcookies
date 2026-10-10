@@ -765,17 +765,26 @@ def main() -> None:
                         if outcome == "success":
                             resume_at = time.time() + SUCCESS_COOLDOWN
                             attempts = 0
+                        elif outcome in ("recent_attempt", "busy"):
+                            # The guard mark or lock is held by a concurrent
+                            # attempt (daemon + manual, or a pre-restart mark).
+                            # Nothing was typed, so no strikes were burned:
+                            # re-check once the guard window has elapsed
+                            # instead of standing down forever (the state
+                            # stays "down" until a sign-in happens, so
+                            # human_needed would never be reset).
+                            log("blocked by reentry guard; re-checking in 30m")
+                            resume_at = time.time() + REENTRY_GUARD
                         elif outcome in RETRYABLE and attempts + 1 < MAX_ATTEMPTS:
                             attempts += 1
                         else:
                             human_needed = True
-                            if outcome not in ("recent_attempt", "busy"):
-                                notify(
-                                    "manual re-auth needed",
-                                    f"auto sign-in could not restore the session "
-                                    f"({outcome}) after {attempts + 1} attempt(s); "
-                                    "sign in via noVNC (ytcookies.example.com)",
-                                )
+                            notify(
+                                "manual re-auth needed",
+                                f"auto sign-in could not restore the session "
+                                f"({outcome}) after {attempts + 1} attempt(s); "
+                                "sign in via noVNC (ytcookies.example.com)",
+                            )
             else:
                 human_needed = False
         except Exception as exc:
