@@ -423,21 +423,96 @@ def _clear_browser_state(ws) -> None:
     log("vault cleared: cookies, cache, and site storage")
 
 
-def prepare_resignin() -> None:
-    """Bring the visible tab as close to the password step as possible so
-    manual re-auth is just typing the password. Never disturbs a tab already
-    at the password step. Handles the account chooser (clicks the remembered
-    account) and the identifier page (prefills the email). Dismisses
-    post-verification onboarding cards (gds.google.com: recovery phone, home
-    address, ...) by clicking their skip/cancel button — those cards are
-    sticky and hold an already-authenticated sign-in until skipped. If the
-    flow is walled off by Google's CookieMismatch / session-expired page,
-    clears the vault and retries once."""
+def _park_tab_blank(ws, msg_id: int) -> tuple[bool, int]:
+    """Park the tab on about:blank via CDP and verify it landed there.
+    about:blank makes no network request, so the park is invisible to
+    Google; what it removes is the ambient rotation — a warm signed-in
+    page keeps re-minting the browser's cookie copy and fights the
+    consumers' write-backs on the file. The read-back matters: a
+    fire-and-forget park that silently no-ops leaves the vault tab warm
+    and the cheap re-seeds paper over it. One retry on mismatch.
+    Returns (parked, msg_id)."""
+    for attempt in (1, 2):
+        cdp_call(ws, msg_id, "Page.enable")
+        msg_id += 1
+        cdp_call(ws, msg_id, "Page.navigate", {"url": "about:blank"})
+        msg_id += 1
+        time.sleep(2.0)  # let the navigation settle
+        res = cdp_call(
+            ws,
+            msg_id,
+            "Runtime.evaluate",
+            {"expression": "location.href", "returnByValue": True},
+        )
+        msg_id += 1
+        href = str((res.get("result") or {}).get("value") or "")
+        if href == "about:blank":
+            log(f"parked tab on about:blank (verified, attempt {attempt})")
+            return True, msg_id
+        log(f"park verify failed (attempt {attempt}): page at {href[:120]}")
+    return False, msg_id
+
+
+def _refresh_from_bounce(ws, msg_id: int) -> tuple[str, str | None]:
+    """The sign-in navigation bounced to the signed-in destination: the
+    base session is alive and the exchange minted a fresh SID into the
+    jar. Harvest it into the file, confirm it live server-side, and park
+    the tab — an explicit, death-triggered refresh instead of an ambient
+    warm tab. Returns (outcome, jar fingerprint): "refreshed" (file
+    seeded and confirmed; the caller sets state up) or "stale" (tab
+    parked, file not seeded — external-write cooldown or a dead jar; the
+    fast path / next cycle picks it up)."""
+    try:
+        cookies = fetch_cookies()
+    except Exception as exc:
+        log(f"post-bounce jar fetch failed: {exc}")
+        _park_tab_blank(ws, msg_id)
+        return "stale", None
+    if _cookies_have_login(cookies):
+        fp = cookie_fingerprint(cookies)
+        if _export_if_ok(cookies, "file re-seeded after sign-in refresh"):
+            alive = probe_file()
+            if alive:
+                parked, _ = _park_tab_blank(ws, msg_id)
+                if not parked:
+                    log("WARNING: tab not parked after refresh; vault tab may stay warm")
+                return "refreshed", fp
+            if alive is False:
+                log("post-bounce jar is dead server-side; leaving state down")
+            else:
+                log("post-bounce probe inconclusive; leaving state down for the next cycle")
+    else:
+        log("post-bounce jar has no login; leaving state down")
+    # Seed blocked by an in-flight write-back (or the jar stale): park
+    # anyway — the jar stays readable from about:blank and the fast path
+    # seeds the file once the external-write cooldown clears.
+    _park_tab_blank(ws, msg_id)
+    return "stale", None
+
+
+def prepare_resignin() -> tuple[str, str | None]:
+    """Explicit session refresh / re-auth staging. Navigates the vault tab
+    to the sign-in flow and reads where it lands:
+      - base session alive -> the flow bounces to the signed-in
+        destination; _refresh_from_bounce harvests the freshly minted SID
+        into the file and parks the tab ("refreshed"/"stale");
+      - base session dead -> the tab is staged at the password step (or a
+        challenge / gds card) for auto_signin or a human via noVNC
+        ("staged"); the tab may sit in the auth flow — that is an active
+        auth procedure, not idle.
+    Never disturbs a tab already at the password step. Handles the account
+    chooser (clicks the remembered account) and the identifier page
+    (prefills the email). Dismisses post-verification onboarding cards
+    (gds.google.com: recovery phone, home address, ...) by clicking their
+    skip/cancel button — those cards are sticky and hold an
+    already-authenticated sign-in until skipped. If the flow is walled off
+    by Google's CookieMismatch / session-expired page, clears the vault and
+    retries once. Returns (outcome, jar fingerprint after a refresh)."""
     try:
         targets = http_json(f"http://{CDP_HOST}:{CDP_PORT}/json")
         pages = [t for t in targets if t.get("type") == "page"]
         if not pages:
-            return
+            return "no_page", None
         ws = websocket.create_connection(
             pages[0]["webSocketDebuggerUrl"], timeout=15, origin=""
         )
@@ -459,7 +534,7 @@ def prepare_resignin() -> None:
                 cdp_call(ws, 3, "Page.navigate", {"url": "https://www.youtube.com/signin"})
             expr = _stage_js()
             result = _stage_poll(ws, expr)
-            if result == "no target yet":
+            if result == "no target yet" or result.endswith("-> no target yet"):
                 now = cdp_call(
                     ws,
                     50,
@@ -474,14 +549,18 @@ def prepare_resignin() -> None:
                     cdp_call(ws, 301, "Page.navigate", {"url": "https://www.youtube.com/signin"})
                     result = _stage_poll(ws, expr, msg_id=400)
                     log(f"re-sign-in prepared (after vault clear): {result}")
-                    return
+                    return "staged", None
+                if "youtube.com" in now and "accounts.google.com" not in now:
+                    return _refresh_from_bounce(ws, 500)
                 log(f"re-sign-in prepared: no target; page at {now or 'unknown URL'}")
-                return
+                return "staged", None
             log(f"re-sign-in prepared: {result}")
+            return "staged", None
         finally:
             ws.close()
     except Exception as exc:
         log(f"prepare_resignin failed: {exc}")
+        return "no_page", None
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +641,11 @@ def _cookies_have_login(cookies: list, key="name") -> bool:
 
 
 def navigate_to_youtube() -> None:
-    """Reload the first page target at YouTube so imported cookies apply."""
+    """Load the first page target at YouTube so imported cookies apply,
+    then park it back on about:blank: the load activates the imported
+    cookies in the browser, and the park keeps the vault tab inert (a
+    warm signed-in page keeps rotating the browser's cookie copy and
+    fights the consumers' write-backs)."""
     try:
         targets = http_json(f"http://{CDP_HOST}:{CDP_PORT}/json")
         pages = [t for t in targets if t.get("type") == "page"]
@@ -575,7 +658,9 @@ def navigate_to_youtube() -> None:
         try:
             cdp_call(ws, 1, "Page.enable")
             cdp_call(ws, 2, "Page.navigate", {"url": "https://www.youtube.com"})
+            time.sleep(10.0)  # let the page load and the imported cookies apply
             log("reloaded YouTube page to activate imported cookies")
+            _park_tab_blank(ws, 3)
         finally:
             ws.close()
     except Exception as exc:
@@ -763,11 +848,22 @@ def main() -> None:
                             else:
                                 log("seeded jar is also dead server-side")
                         if state == "down":
-                            # Re-stage the password step: idempotent (no-op at
-                            # the password step) and never touches the file, so
-                            # it also covers "jar has no login" and "seed
-                            # blocked by an in-flight write-back".
-                            prepare_resignin()
+                            # Explicit refresh: the sign-in navigation bounces
+                            # (base session alive -> fresh SID harvested into
+                            # the file, tab parked) or stages the flow for
+                            # auto_signin / a human. Also covers "jar has no
+                            # login" and "seed blocked by an in-flight
+                            # write-back".
+                            outcome, refreshed_fp = prepare_resignin()
+                            if outcome == "refreshed":
+                                if refreshed_fp:
+                                    last_fp = refreshed_fp
+                                state, state_since = "up", time.time()
+                                log("SESSION UP (file re-seeded after sign-in refresh)")
+                                notify(
+                                    "session_restored",
+                                    "file re-seeded after sign-in refresh",
+                                )
             if cookies is not None:
                 prev_jar_login = jar_login
             write_session_state(state)

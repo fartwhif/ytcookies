@@ -512,17 +512,42 @@ def _navigate_to_signin() -> bool:
     return True
 
 
-def _park_tab_blank() -> None:
+def _park_tab_blank(ws, mid: int) -> int:
     """Park the tab on about:blank using the same VNC omnibox navigation as
     above (real keystrokes; owner's call): a live YouTube page keeps
     rotating the browser's cookie copy, while the file — owned by the
-    yt-dlp services — is the live session. Keep the vault's tab inert."""
+    yt-dlp services — is the live session. Keep the vault's tab inert.
+    Verifies the tab actually landed on about:blank (the keystrokes alone
+    are fire-and-forget: a silently failed park leaves the vault tab warm
+    and the downstream cheap re-seeds paper over it). One retry on
+    mismatch. Returns the next msg id."""
     time.sleep(random.uniform(3.0, 6.0))  # let the post-login settle
-    ok, _ = vnc_request("/combo", {"mod": "ctrl", "key": "l"})
-    if ok:
-        time.sleep(random.uniform(0.5, 1.2))  # let the omnibox take focus
-        ok, _ = vnc_request("/type", {"text": "about:blank\n"})
-    log(f"parked tab on about:blank (ok={ok})")
+    for attempt in (1, 2):
+        ok, _ = vnc_request("/combo", {"mod": "ctrl", "key": "l"})
+        if ok:
+            time.sleep(random.uniform(0.5, 1.2))  # let the omnibox take focus
+            ok, _ = vnc_request("/type", {"text": "about:blank\n"})
+        time.sleep(2.0)  # let the navigation settle
+        href = str(_eval(ws, mid, "location.href") or "")
+        mid += 1
+        if href == "about:blank":
+            log(f"parked tab on about:blank (verified, attempt {attempt})")
+            return mid
+        log(f"park verify failed (attempt {attempt}): page at {href[:120]}")
+        if not ok:
+            return mid  # VNC down: a retry cannot help
+    return mid
+
+
+def _at_auth_page(ws, mid: int) -> tuple[bool, int]:
+    """True while the tab sits in the Google sign-in flow (chooser,
+    identifier, password, 2fa/challenge, or a sticky gds onboarding card):
+    that is an active auth procedure, and a failed attempt leaves the
+    screen as-is for a human via noVNC. Anything else (a signed-in
+    destination, about:blank, ...) is parked. Returns (at_auth_page, mid)."""
+    href = str(_eval(ws, mid, "location.href") or "")
+    mid += 1
+    return ("accounts.google.com" in href or _is_gds_card(href)), mid
 
 
 def flow_age(ws, mid: int) -> tuple[float | None, int]:
@@ -635,11 +660,14 @@ def _do_attempt() -> str:
             return "vnc_unreachable"
         if outcome == "signed in":
             log(f"sign-in already complete (tab at {href[:120]})")
-            _park_tab_blank()
+            mid = _park_tab_blank(ws, mid)
             return "success"
         if outcome != "password":
             log(f"staging ended at '{stage}'")
-            return classify_page(ws, mid)
+            outcome = classify_page(ws, mid)
+            if not _at_auth_page(ws, mid):
+                mid = _park_tab_blank(ws, mid)
+            return outcome
         # The v3 flow is a server-side session with a ~20-min lifetime;
         # the exporter may have staged this page minutes ago. Submitting
         # into a stale flow returns the generic "Something went wrong"
@@ -655,11 +683,14 @@ def _do_attempt() -> str:
                 return "vnc_unreachable"
             if outcome == "signed in":
                 log(f"sign-in already complete (tab at {href[:120]})")
-                _park_tab_blank()
+                mid = _park_tab_blank(ws, mid)
                 return "success"
             if outcome != "password":
                 log(f"staging after fresh flow ended at '{stage}'")
-                return classify_page(ws, mid)
+                outcome = classify_page(ws, mid)
+                if not _at_auth_page(ws, mid):
+                    mid = _park_tab_blank(ws, mid)
+                return outcome
         time.sleep(random.uniform(3.0, 7.0))  # read the password page
         # Password via the VNC sibling as real keystrokes - NOT CDP synthetic
         # events and NOT a clipboard paste: Google rejects both as
@@ -720,7 +751,7 @@ def _do_attempt() -> str:
             return "vnc_unreachable"
         outcome = verify_result(ws, mid, pre_href, pre_text)
         if outcome == "success":
-            _park_tab_blank()
+            mid = _park_tab_blank(ws, mid)
         return outcome
     finally:
         ws.close()

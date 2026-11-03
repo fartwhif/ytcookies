@@ -85,7 +85,7 @@ chromium \
   --hide-crash-restore-bubble \
   --disable-features=Translate \
   --lang=en-US \
-  "https://www.youtube.com" &
+  "about:blank" &
 
 # ── Auto sign-in daemon (background) ──────────────────────────────
 # Completes re-auth when the session dies: fuzzed human-like delay,

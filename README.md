@@ -7,7 +7,9 @@ file on a volume mount.
 ## How it works
 - Chromium runs headless (Xvfb) with a **persistent profile** at ./data/profile,
   so the login survives container rebuilds/restarts like a normal browser.
-- noVNC (port 8300) lets you log in / re-authenticate from any browser.
+- noVNC lets you log in / re-authenticate from any browser (remote via
+  ytcookies.example.com; the in-container websockify port is bound to the
+  workstation loopback only).
 - cookie_exporter.py watches the Chrome DevTools endpoint (localhost-only CDP).
   While the cookie file's session is dead it seeds ./data/cookies.txt (Netscape
   format) from the browser jar; a live file is never touched, because it is
@@ -23,15 +25,31 @@ the headless browser is just a sign-in vault.
 Every ~10.5 min the exporter verifies the FILE's session server-side: one
 GET https://www.youtube.com/account with the file's cookies. Live -> the
 account page; killed -> 30x to accounts.google.com. No browser traffic is
-involved. On death it logs `SESSION DEAD`, pushes a notification (if
-configured), and pre-stages the sign-in page as far as possible (clicks the
-remembered account, prefills the email, dismisses onboarding cards) so
-re-auth is just typing the
-password. When you sign in via noVNC, the exporter seeds the dead file from
-the browser jar within ~30s and confirms liveness -> `SESSION UP` +
-notification. If the browser profile ever loses its login while the file is
-still live (container restart, profile wipe), the file is imported back into
-the browser once so the vault stays warm.
+involved.
+
+The vault tab otherwise idles on `about:blank` (owner's invariant): a warm
+signed-in page keeps rotating the browser's cookie copy and fights the
+consumers' write-backs on the file, so the tab only ever sits in a Google
+flow while an auth procedure is actively running. Every park is verified
+(location.href read-back, one retry).
+
+On death it logs `SESSION DEAD`, pushes a notification (if configured),
+tries a cheap re-seed of the file from the browser jar (covers the
+"jar still holds a live session" edge), and if the state is still down
+runs the explicit refresh: the sign-in navigation is issued and where it
+lands decides the outcome:
+- **base session alive** -> the flow bounces to the signed-in destination
+  and the exchange mints a fresh SID into the jar; the exporter harvests
+  it into the file, confirms liveness server-side, parks the tab ->
+  `SESSION UP` with no password involved;
+- **base session dead** -> the flow is staged as far as possible (clicks
+  the remembered account, prefills the email, dismisses onboarding cards)
+  and left at the password step for the auto sign-in daemon or a human via
+  noVNC; the tab sitting in the auth flow IS the active procedure.
+If the browser profile ever loses its login while the file is still live
+(container restart, profile wipe), the file is imported back into the
+browser, the tab loads YouTube once so the imported cookies apply, and
+parks on `about:blank` again.
 If Google walls the sign-in flow with its CookieMismatch / session-expired
 page (lingering killed-session cookies), the exporter does the full
 "delete browsing data" clear itself (cookies + cache + site storage) and
@@ -109,7 +127,10 @@ source of truth. All timing (pre-typing delay, keystroke rhythm) is
 fuzzed so the re-auth does not look machine-paced.
 
 ## Access
-- https://ytcookies.example.com  -> noVNC, password is VNC_PASSWORD in .env
+- https://ytcookies.example.com  -> noVNC backstop door: HTTP basic auth on
+  top of the VNC password. Basic-auth user `novnc`, password is
+  `NOVNC_HTTP_PASS` in .env (nginx htpasswd on the VPS); the VNC password
+  is `VNC_PASSWORD` in .env. The vhost is rate-limited (5 r/s, burst 20).
 - Cookie file: /home/user/projects/ytcookies/data/cookies.txt
 
 ## Using the cookies with yt-dlp

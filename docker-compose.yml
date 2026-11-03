@@ -13,7 +13,7 @@ services:
     dns:
       - 10.99.0.42
     ports:
-      - "8300:8300"
+      - "127.0.0.1:8300:8300"
     volumes:
       - ./data:/data
       - /lib/modules:/lib/modules:ro
