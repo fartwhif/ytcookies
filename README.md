@@ -7,9 +7,9 @@ file on a volume mount.
 ## How it works
 - Chromium runs headless (Xvfb) with a **persistent profile** at ./data/profile,
   so the login survives container rebuilds/restarts like a normal browser.
-- noVNC lets you log in / re-authenticate from any browser (remote via
-  ytcookies.example.com; the in-container websockify port is bound to the
-  workstation loopback only).
+- noVNC lets you log in / re-authenticate from any browser (remotely via the
+  public URL in `VNC_URL`, see Access; the in-container websockify port is
+  bound to the host loopback only).
 - cookie_exporter.py watches the Chrome DevTools endpoint (localhost-only CDP).
   While the cookie file's session is dead it seeds ./data/cookies.txt (Netscape
   format) from the browser jar; a live file is never touched, because it is
@@ -73,7 +73,8 @@ delay the post-sign-in re-seed.
 
 Env vars (all optional):
 - `NTFY_TOPIC` — ntfy.sh topic for `session_dead` / `session_restored` pushes
-- `NOTIFY_WEBHOOK_URL` — POSTs `{event, detail, time}` JSON to this URL
+- `VNC_URL` — public URL of the noVNC backstop door, quoted in those pushes so
+  a human knows where to sign in (unset: the messages just say "via noVNC")
 - `COOKIE_SESSION_PROBE` — liveness probe interval in seconds (default 630; offset from the consumers' ~10-min write-back cadence)
 - `GOOGLE_EMAIL` — account shown in the sign-in chooser; the exporter clicks it when the session dies
 - `DRIVEPOD_API_URL` — DrivePod backend for UA sync (default `http://drivepod:3000` on the docker `shared` network)
@@ -127,25 +128,27 @@ source of truth. All timing (pre-typing delay, keystroke rhythm) is
 fuzzed so the re-auth does not look machine-paced.
 
 ## Access
-- https://ytcookies.example.com  -> noVNC backstop door: HTTP basic auth on
-  top of the VNC password. Basic-auth user `novnc`, password is
-  `NOVNC_HTTP_PASS` in .env (nginx htpasswd on the VPS); the VNC password
-  is `VNC_PASSWORD` in .env. The vhost is rate-limited (5 r/s, burst 20).
-- Cookie file: /home/user/projects/ytcookies/data/cookies.txt
+- `VNC_URL` in .env names the public URL of the noVNC backstop door (the same
+  value the ntfy session messages quote). Behind it: HTTP basic auth on top of
+  the VNC password. Basic-auth user `novnc`, password is `NOVNC_HTTP_PASS` in
+  .env (nginx htpasswd on the VPS); the VNC password is `VNC_PASSWORD` in .env.
+  The vhost is rate-limited (5 r/s, burst 20).
+- Cookie file: ./data/cookies.txt (the `./data` volume mount)
 
 ## Using the cookies with yt-dlp
-    yt-dlp --cookies /home/user/projects/ytcookies/data/cookies.txt <url>
+    yt-dlp --cookies <repo>/data/cookies.txt <url>
 
 For other yt-dlp services on the LAN, mount this container's data dir and
 point them at data/cookies.txt.
 
 ## Ops
-    cd /home/user/projects/ytcookies
+    cd <repo>   # this project's directory
     docker compose build && docker compose up -d
     docker logs -f ytcookies   # "[cookie-exporter] SESSION DEAD/UP, cookies exported: N total"
 
-- WireGuard peer 10.99.0.240 (WG key in .env, peer on vps wg0).
-- Docker network pinned to 172.33.0.0/16 — must not overlap WG 10.99.0.0/20.
-- Cert: DNS-01 via <dns-provider>, renews automatically (certbot 5.6.0 on vps).
+- WireGuard peer address from `WG_ADDRESS` in .env (WG key in .env, peer on the
+  VPS wg0). `WG_DNS` in .env is the tunnel DNS the compose file hands the container.
+- Docker network pinned to 172.33.0.0/16 — must not overlap the WG tunnel subnet.
+- Cert: DNS-01 via the DNS provider in .env, renews automatically (certbot on the VPS).
 - The entrypoint clears stale Chromium SingletonLock files on start (safe:
   only one container runs at a time).

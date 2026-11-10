@@ -39,6 +39,9 @@ EMAIL = os.environ.get("GOOGLE_EMAIL", "").strip()
 PASSWORD = os.environ.get("GOOGLE_PASSWORD", "").strip()
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
+# Same backstop-door hint as the exporter: env-supplied, never hardcoded.
+VNC_URL = os.environ.get("VNC_URL", "").strip()
+VNC_HINT = f"noVNC {VNC_URL}" if VNC_URL else "noVNC"
 VNC_DRIVER_URL = os.environ.get("VNC_DRIVER_URL", "http://vncdriver:8123")
 POLL_SECONDS = int(os.environ.get("AUTO_SIGNIN_POLL", "30"))
 # Fuzzed delay (seconds) between "session down" and actually typing.
@@ -814,7 +817,7 @@ def main() -> None:
                                 "manual re-auth needed",
                                 f"auto sign-in could not restore the session "
                                 f"({outcome}) after {attempts + 1} attempt(s); "
-                                "sign in via noVNC (ytcookies.example.com)",
+                                f"sign in via {VNC_HINT}",
                             )
             else:
                 human_needed = False

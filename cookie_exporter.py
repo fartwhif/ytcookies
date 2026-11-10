@@ -52,6 +52,10 @@ SESSION_PROBE_INTERVAL = int(os.environ.get("COOKIE_SESSION_PROBE", "630"))
 # Notification channels for session death/recovery (both optional).
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
+# Where the noVNC backstop door is reached, so the death messages can point a
+# human at it without hardcoding a deployment's hostname in source.
+VNC_URL = os.environ.get("VNC_URL", "").strip()
+VNC_HINT = f"noVNC {VNC_URL}" if VNC_URL else "noVNC"
 # Google account email; prefilled/clicked on the sign-in page when the
 # session dies.
 GOOGLE_EMAIL = os.environ.get("GOOGLE_EMAIL", "").strip()
@@ -823,13 +827,13 @@ def main() -> None:
                         if AUTO_SIGNIN:
                             detail = (
                                 "cookie file session killed by Google; auto "
-                                "re-auth in progress (manual fallback: noVNC "
-                                "ytcookies.example.com)"
+                                f"re-auth in progress (manual fallback: "
+                                f"{VNC_HINT})"
                             )
                         else:
                             detail = (
                                 "cookie file session killed by Google; re-sign "
-                                "in via noVNC (ytcookies.example.com)"
+                                f"in via {VNC_HINT}"
                             )
                         notify("session_dead", detail)
                         state, state_since = "down", time.time()

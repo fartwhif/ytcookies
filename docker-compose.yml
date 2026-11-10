@@ -10,8 +10,10 @@ services:
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv4.ip_forward=1
+    # The WireGuard tunnel's DNS (the VPS peer); deployment config, so it
+    # comes from .env rather than being hardcoded here.
     dns:
-      - 10.99.0.42
+      - ${WG_DNS:-10.99.0.42}
     ports:
       - "127.0.0.1:8300:8300"
     volumes:
@@ -49,7 +51,8 @@ networks:
     driver: bridge
     ipam:
       config:
-        # Must NOT overlap the WireGuard subnet 10.99.0.0/20
+        # Must NOT overlap the WireGuard tunnel subnet (documented as
+        # 10.99.0.0/20; this 172.x bridge is disjoint from it).
         - subnet: 172.33.0.0/16
   shared:
     external: true
