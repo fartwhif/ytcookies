@@ -26,6 +26,7 @@ while the file is still live (container restart, profile wipe), the file is
 imported back into the browser so the vault stays warm.
 """
 
+import fcntl
 import json
 import os
 import time
@@ -41,6 +42,12 @@ OUT_PATH = os.environ.get("COOKIES_FILE", "/data/cookies.txt")
 # the shared cookie file's session is dead (dead-cookie harvests only
 # hammer Google and their write-backs delay our re-seed).
 SESSION_STATE_PATH = os.environ.get("COOKIE_SESSION_STATE", "/data/session-state.json")
+# Single-instance guard: a second watcher means two independent liveness
+# state machines (duplicate session_dead/session_restored pushes, offset by
+# each instance's probe phase) and two writers racing the consumers'
+# write-backs. Held for the whole run via _LOCK_FH below.
+LOCK_PATH = os.path.join(os.path.dirname(SESSION_STATE_PATH) or "/", "exporter.lock")
+_LOCK_FH = None  # set by acquire_instance_lock(); held for the whole run
 POLL_SECONDS = int(os.environ.get("COOKIE_POLL_INTERVAL", "30"))
 # If the cookies file was written from outside (yt-dlp write-back), don't
 # overwrite it for this long.
@@ -754,7 +761,22 @@ def sync_user_agent() -> tuple[bool, str]:
     )
 
 
+def acquire_instance_lock() -> None:
+    """Exit unless this process owns LOCK_PATH. flock (not a pid file) so a
+    holder that died can never strand the lock."""
+    global _LOCK_FH
+    _LOCK_FH = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            f"another cookie_exporter is already watching {OUT_PATH} "
+            f"(holds {LOCK_PATH}); this copy exits"
+        )
+
+
 def main() -> None:
+    acquire_instance_lock()
     channels = "+".join(
         [n for n, v in (("ntfy", NTFY_TOPIC), ("webhook", NOTIFY_WEBHOOK_URL)) if v]
     ) or "none"

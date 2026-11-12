@@ -152,3 +152,10 @@ point them at data/cookies.txt.
 - Cert: DNS-01 via the DNS provider in .env, renews automatically (certbot on the VPS).
 - The entrypoint clears stale Chromium SingletonLock files on start (safe:
   only one container runs at a time).
+- Single instance by construction: the exporter takes an exclusive `flock` on
+  `./data/exporter.lock` for its whole run, so a stray second copy — e.g. a
+  `docker exec ytcookies python3 /app/cookie_exporter.py …` whose client was
+  killed, leaving it orphaned as PID 1's sibling — exits at once instead of
+  running a second liveness state machine (which pushed every
+  `session_dead`/`session_restored` twice, minutes apart, and raced the
+  consumers' write-backs on the cookie file).
