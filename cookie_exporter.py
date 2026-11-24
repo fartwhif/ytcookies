@@ -17,6 +17,16 @@ Division of labor (this matters!):
   (live -> the account page; dead -> 30x to accounts.google.com). One cheap
   request, zero headless-browser traffic.
 
+The watcher is designed to run for ever WITHOUT a browser: chromium is only
+needed to sign in, and every other job here (export, watch, notify, seed) is
+done with the file and one HTTP request. Two rules make a browserless watcher
+honest, because its report is a FILE whose age is the liveness signal:
+
+- HEARTBEAT: while it is alive it republishes the verdict every
+  COOKIE_STATE_HEARTBEAT seconds, so nobody has to trust an ageing string.
+- STALE: a verdict older than COOKIE_SESSION_STALE is a reading nobody has
+  re-confirmed, so it is published as 'unknown', never frozen as 'up'.
+
 On death: logs SESSION DEAD, pushes a notification (ntfy/webhook), and
 pre-stages the sign-in page (clicks the remembered account / prefills the
 email) so re-auth is just typing the password. When the browser jar gains a
@@ -56,6 +66,45 @@ EXTERNAL_WRITE_COOLDOWN = int(os.environ.get("COOKIE_EXTERNAL_COOLDOWN", "120"))
 # no browser involved). 630s (not 600) so the probe stays out of lockstep
 # with the ~10-min consumer write-back cycles that keep the file mtime fresh.
 SESSION_PROBE_INTERVAL = int(os.environ.get("COOKIE_SESSION_PROBE", "630"))
+# How long the current verdict stays PUBLISHABLE. A probe that could not answer
+# (Google unreachable, DNS dead, the box off its WAN) leaves the verdict
+# untouched, and a file that just repeats the last answer is indistinguishable
+# from a watcher that died: consumers judge liveness by this file's age. So an
+# answer nobody has re-confirmed is published as 'unknown' instead of frozen -
+# 'up' unproven must not keep a dead jar in use.
+#
+# The downgrade is deliberately ONE-WAY: it applies to 'up' only. 'down' is the
+# conservative report (consumers hold off, re-auth stays armed), so a
+# session known dead but no longer provable stays 'down' rather than opening
+# the harvesters back up on the strength of a network failure.
+# 3 probe intervals: two failed ticks still keep a usable report.
+STALE_VERDICT = int(os.environ.get("COOKIE_SESSION_STALE",
+                                  str(3 * SESSION_PROBE_INTERVAL)))
+# How often the watcher re-publishes its verdict while it is alive (a file
+# write, no request). This is the heartbeat that separates "alive and still
+# up" from "gone, leaving an 'up' file": every reader's freshness test is a
+# timestamp, so a watcher that only writes on transitions makes a healthy
+# session look broken on a calm day - and a supervisor that restarts
+# chromium to re-verify a verdict looks the worse for it.
+STATE_HEARTBEAT = int(os.environ.get("COOKIE_STATE_HEARTBEAT", "300"))
+# Re-check the file EARLY when it changed under the verdict. probe_file() answers
+# a question about BYTES in OUT_PATH; if the file was replaced since that answer
+# (this process seeded it, a vault import rewrote it, a sign-in refresh landed),
+# the answer describes somebody else's jar. While the verdict is 'up' this is
+# deliberately ignored: a live session does not need re-proof because a consumer
+# re-wrote the file, and answering every write-back would put the probe back in
+# lockstep with the ~10-min cycles SESSION_PROBE_INTERVAL exists to dodge. While
+# it is not 'up' the consumers are paused (their harvest gates read this same
+# file), so nothing but our own writes moves the mtime and an early answer is
+# exactly what the next decision needs. 60s (not 0) bounds a file being thrashed.
+CHANGE_PROBE_MIN = int(os.environ.get("COOKIE_PROBE_ON_CHANGE", "60"))
+# How often to ask the browser for its UA and re-push it when it differs from
+# what the consumers were last told (see seed_user_agent). Asking - rather than
+# syncing once at startup and never again - is what keeps the seed honest: the
+# chromium that mints the NEXT session may be newer than the one that minted
+# the last, and only a later check finds that out. The question is a two-line
+# CDP GET; while no browser is running it is a refused connection, silent.
+UA_SYNC_INTERVAL = int(os.environ.get("COOKIE_UA_SYNC", "600"))
 # Notification channels for session death/recovery (both optional).
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
@@ -273,6 +322,85 @@ def probe_file() -> bool | None:
         return None
     except Exception:
         return None
+
+
+def read_state_file() -> dict | None:
+    """The last payload this watcher published (None if absent or torn)."""
+    try:
+        with open(SESSION_STATE_PATH) as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def jar_mtime() -> float:
+    """mtime of the jar BYTES that probe_file() describes (0.0 when OUT_PATH is
+    absent, which counts as 'changed' the moment a jar appears)."""
+    try:
+        return os.path.getmtime(OUT_PATH)
+    except OSError:
+        return 0.0
+
+
+def seed_user_agent() -> str | None:
+    """Recover the browser UA a previous run recorded, before anything probes.
+
+    The consumers must present the same UA as the browser that minted the
+    session - and so must our own probe, because PROBE_USER_AGENT is the header
+    the liveness GET carries. A watcher that runs for ever with no chromium
+    never reaches CDP to learn the browser's real UA, so without this seed the
+    fallback string (a pinned Chrome/<version>) silently diverges from the
+    browser started weeks later that mints the next session, and the
+    mismatched-UA kill this whole design exists to avoid comes back.
+    """
+    global LIVE_UA, PROBE_USER_AGENT
+    payload = read_state_file() or {}
+    ua = str(payload.get("ua") or "").strip() or None
+    if ua:
+        LIVE_UA = ua
+        PROBE_USER_AGENT = ua
+    return ua
+
+
+def publishable(state: str, verdict_at: float) -> str:
+    """The verdict to put on disk: what a probe ANSWERED, or 'unknown' once
+    that answer is too old to repeat. See STALE_VERDICT for why 'down' is not
+    downgraded."""
+    if state == "up" and time.time() - verdict_at > STALE_VERDICT:
+        return "unknown"
+    return state
+
+
+def death_detail() -> str:
+    """The session_dead message: what to do about it depends on whether an auto
+    re-auth daemon is running at all (GOOGLE_PASSWORD configured)."""
+    if AUTO_SIGNIN:
+        return ("cookie file session killed by Google; auto re-auth in progress "
+                f"(manual fallback: {VNC_HINT})")
+    return f"cookie file session killed by Google; re-sign in via {VNC_HINT}"
+
+
+def bootstrap_state() -> str:
+    """Liveness to publish on startup, instead of a blind 'unknown'.
+
+    'unknown' is what a watcher with no evidence can honestly say, and on a vault
+    that has never exported it is the wrong evidence: nothing is live, but
+    'unknown' is neither `up` nor `down`, and only `down` arms auto_signin.
+    Probing decides which kind of unknown we are in:
+      - the file presents a session and the server accepts it  -> 'up'
+      - the server bounces it                                  -> 'down'
+      - the file presents nothing (never exported / empty)     -> 'down'
+      - the file has cookies but the probe could not answer    -> 'unknown'
+    """
+    alive = probe_file()
+    if alive is True:
+        return "up"
+    if alive is False:
+        return "down"
+    if file_cookie_header() is None:
+        return "down"
+    return "unknown"
 
 
 def write_session_state(state: str) -> None:
@@ -713,6 +841,7 @@ def maybe_import(cookies: list) -> bool:
 
 
 LIVE_UA: str | None = None  # last UA read from the browser (source of truth)
+PUSHED_UA: str | None = None  # last UA confirmed delivered to both consumers
 
 def browser_user_agent() -> str | None:
     """The browser's real UA from CDP /json/version (None while CDP is down)."""
@@ -742,15 +871,19 @@ def _http_post_json(url: str, payload: dict) -> bool:
 
 def sync_user_agent() -> tuple[bool, str]:
     """Push the browser's UA to the cookie consumers (DrivePod, GrabbyTube).
-    Returns (ok, summary). Both services persist the value themselves, so a
-    single success is permanent until the browser's UA changes (rebuild)."""
-    global PROBE_USER_AGENT
+    Returns (ok, summary). Both services persist the value themselves, so one
+    success lasts until the browser's UA changes (rebuild); PUSHED_UA records
+    which value that was, so the periodic re-ask costs its POSTs only when the
+    browser differs from what the consumers were last told."""
+    global PROBE_USER_AGENT, PUSHED_UA
     ua = browser_user_agent()
     if not ua:
         return False, "ua sync: browser UA unavailable (CDP down)"
     PROBE_USER_AGENT = ua
     dp = _http_post_json(f"{DRIVEPOD_API_URL}/api/config", {"userAgent": ua})
     gt = _http_post_json(f"{GRABBY_API_URL}/settings/user-agent", {"user_agent": ua})
+    if dp and gt:
+        PUSHED_UA = ua
     try:
         chrome = ua.split("Chrome/", 1)[1].split(" ", 1)[0]
     except IndexError:
@@ -780,18 +913,55 @@ def main() -> None:
     channels = "+".join(
         [n for n, v in (("ntfy", NTFY_TOPIC), ("webhook", NOTIFY_WEBHOOK_URL)) if v]
     ) or "none"
+    seeded = seed_user_agent()
     log(
         f"starting: cdp={CDP_HOST}:{CDP_PORT} out={OUT_PATH} "
-        f"poll={POLL_SECONDS}s probe={SESSION_PROBE_INTERVAL}s notify={channels}"
+        f"poll={POLL_SECONDS}s probe={SESSION_PROBE_INTERVAL}s "
+        f"heartbeat={STATE_HEARTBEAT}s notify={channels}"
+        + (f" ua seeded from {SESSION_STATE_PATH}" if seeded else "")
     )
-    write_session_state("unknown")
-    last_fp = None
-    state = "unknown"  # liveness of the FILE's session: unknown | up | down
+    # First report: a verdict, not a blind 'unknown'. 'unknown' is neither up
+    # nor down, and only 'down' arms auto_signin, so a vault that has never
+    # exported would look "still deciding" for a whole probe interval while
+    # nothing at all was live. bootstrap_state() probes and decides.
+    state = bootstrap_state()  # liveness of the FILE's session: unknown|up|down
+    verdict_at = time.time()   # when a probe last ANSWERED about the current jar
+    verdict_mtime = jar_mtime()   # the jar bytes that verdict describes
+    last_publish = 0.0
+
+    def publish() -> None:
+        """Write the current verdict, downgraded to 'unknown' if nobody has
+        re-confirmed it, and note the time so the heartbeat is measured from
+        the LAST write, whoever made it."""
+        nonlocal last_publish
+        write_session_state(publishable(state, verdict_at))
+        last_publish = time.time()
+
+    def ask() -> bool | None:
+        """Probe the file, and take note of when it answered and about WHICH
+        bytes: that is what publish() may keep repeating and what the
+        changed-under-the-verdict test compares against. An inconclusive probe
+        refreshes neither, so the verdict ages towards 'unknown' and a pending
+        change stays pending."""
+        nonlocal verdict_at, verdict_mtime
+        alive = probe_file()
+        if alive is not None:
+            verdict_at = time.time()
+            verdict_mtime = jar_mtime()
+        return alive
+
+    publish()
+    if state == "down":
+        log("SESSION DOWN at startup (no live session in the cookie file)")
+        notify("session_dead", death_detail())
+    elif state == "up":
+        log("SESSION UP at startup (file session live)")
     state_since = time.time()
-    last_probe = 0.0
+    last_probe = time.time()   # bootstrap_state() just ran the same probe
+    last_fp = None
     last_confirm = 0.0
     prev_jar_login: bool | None = None  # jar login state at last probe
-    ua_synced = False
+    last_ua_ask = 0.0
     ua_last_log = 0.0
 
     while True:
@@ -803,24 +973,46 @@ def main() -> None:
             log(f"jar fetch failed (browser/CDP {CDP_HOST}:{CDP_PORT}): {exc}")
             cookies, fp, jar_login = None, None, None
 
-        # ---- user-agent sync (once; retried until both consumers accept) ----
-        if not ua_synced:
-            try:
-                ok, summary = sync_user_agent()
-            except Exception as exc:
-                ok, summary = False, f"ua sync failed: {exc}"
-            if ok:
-                ua_synced = True
-                log(summary)
-                write_session_state(state)
-            elif time.time() - ua_last_log >= 300:
-                ua_last_log = time.time()
-                log(summary)
+        # ---- user-agent: re-ask the browser on a cadence, push on change ----
+        # Syncing once was wrong for a watcher that outlives the browser it
+        # learned the UA from: the chromium that mints the NEXT session may
+        # report a different UA, and the state file and the consumers have to
+        # follow it. Asking is free while no browser runs (connection refused);
+        # pushing costs its two POSTs only when the browser differs from what
+        # the consumers were last told.
+        if time.time() - last_ua_ask >= UA_SYNC_INTERVAL:
+            last_ua_ask = time.time()
+            if browser_user_agent() and LIVE_UA != PUSHED_UA:
+                try:
+                    ok, summary = sync_user_agent()
+                except Exception as exc:
+                    ok, summary = False, f"ua sync failed: {exc}"
+                if ok:
+                    log(summary)
+                    publish()
+                elif time.time() - ua_last_log >= 300:
+                    ua_last_log = time.time()
+                    log(summary)
 
         # ---- file session liveness (no browser required) ----
-        if time.time() - last_probe >= SESSION_PROBE_INTERVAL:
+        # SESSION_PROBE_INTERVAL is the calm-day cadence. The second test is the
+        # one that keeps a decision from running on an answer about somebody
+        # else's BYTES: jar_mtime() is compared with the mtime the verdict was
+        # drawn from, so a jar that has NOT been rewritten never asks early —
+        # 'the file is old' is not 'the file changed', and treating it as one
+        # would probe every POLL_SECONDS for the whole time the session is down,
+        # which is the hammering SESSION_PROBE_INTERVAL exists to avoid.
+        # CHANGE_PROBE_MIN (via last_probe) only bounds how often the SAME new
+        # bytes may be re-examined. While the verdict is not 'up' nothing benign
+        # moves the file (the consumers gate on this same file), so a jar that
+        # did change — a seed, a vault import, a landed sign-in — is answered at
+        # once instead of up to a full interval later.
+        if (time.time() - last_probe >= SESSION_PROBE_INTERVAL
+                or (state != "up"
+                    and jar_mtime() != verdict_mtime
+                    and time.time() - last_probe >= CHANGE_PROBE_MIN)):
             last_probe = time.time()
-            file_alive = probe_file()
+            file_alive = ask()
             if file_alive is not None:
                 if file_alive:
                     if state != "up":
@@ -846,25 +1038,14 @@ def main() -> None:
                             f"SESSION DEAD (file session killed; "
                             f"was '{state}' since {since} UTC)"
                         )
-                        if AUTO_SIGNIN:
-                            detail = (
-                                "cookie file session killed by Google; auto "
-                                f"re-auth in progress (manual fallback: "
-                                f"{VNC_HINT})"
-                            )
-                        else:
-                            detail = (
-                                "cookie file session killed by Google; re-sign "
-                                f"in via {VNC_HINT}"
-                            )
-                        notify("session_dead", detail)
+                        notify("session_dead", death_detail())
                         state, state_since = "down", time.time()
                     if cookies is not None:
                         if jar_login and _export_if_ok(
                             cookies, "file dead; browser jar has a login"
                         ):
                             last_fp = fp
-                            if probe_file():
+                            if ask():
                                 state, state_since = "up", time.time()
                                 log("SESSION UP (file re-seeded from browser jar)")
                                 notify(
@@ -892,7 +1073,18 @@ def main() -> None:
                                 )
             if cookies is not None:
                 prev_jar_login = jar_login
-            write_session_state(state)
+            publish()
+
+        # ---- heartbeat: the report's AGE is the liveness signal ----
+        # One file write, no request. Every consumer and supervisor judges this
+        # file by how young it is, so a watcher with nothing new to report still
+        # has to keep reporting: without this, a healthy session on the slow
+        # cadence looks like a dead watcher once MAX_AGE passes and gets its
+        # browser restarted for nothing. publish() applies the staleness rule,
+        # so what a stalled probe keeps repeating here is 'unknown', never a
+        # frozen 'up'.
+        if time.time() - last_publish >= STATE_HEARTBEAT:
+            publish()
 
         # ---- fast path: seed a dead file as soon as the jar changes ----
         if cookies is not None and state != "up" and jar_login and fp != last_fp:
@@ -900,9 +1092,9 @@ def main() -> None:
                 last_fp = fp
                 if time.time() - last_confirm >= 60:
                     last_confirm = time.time()
-                    if probe_file():
+                    if ask():
                         state, state_since = "up", time.time()
-                        write_session_state(state)
+                        publish()
                         log("SESSION UP (file re-seeded from browser jar)")
                         notify(
                             "session_restored",

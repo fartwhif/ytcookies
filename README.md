@@ -58,18 +58,28 @@ restarts the flow — no manual clearing needed.
 **User-Agent sync.** Google also correlates the client fingerprint of a
 session: the session is created by the real Chromium in the vault, so the
 cookie consumers must present the same UA, or the mismatch itself is a kill
-signal. On startup the exporter reads the browser's live UA from CDP and
-pushes it to DrivePod (`POST /api/config`) and GrabbyTube
-(`POST /settings/user-agent`); both persist it in their own databases, so
-it applies immediately and survives restarts. When an image rebuild bumps
-the browser's version, the next exporter start re-syncs automatically — no
-copy-pasting the UA from the noVNC browser. The exporter's own liveness
-probe uses the same live UA.
+signal. The exporter reads the browser's live UA from CDP and pushes it to
+DrivePod (`POST /api/config`) and GrabbyTube (`POST /settings/user-agent`);
+both persist it in their own databases, so it applies immediately and
+survives restarts. It then keeps asking on `COOKIE_UA_SYNC` and re-pushes
+only when the browser's UA differs from what the consumers were last told,
+so an image rebuild that bumps the browser's version is followed without
+copy-pasting anything — and a watcher that outlives the chromium it learned
+the UA from is not stuck with a stale one. While no browser is running the
+question is a refused connection (silent) and the value already recorded in
+`session-state.json` is what the consumers keep using. The exporter's own
+liveness probe uses the same UA.
 
 The exporter also writes `session-state.json` next to the cookie file;
-DrivePod skips harvest rounds while it says `down` (and is fresh, <30 min) —
-a dead-session harvest would only worsen the kill, and its write-backs would
-delay the post-sign-in re-seed.
+DrivePod skips harvest rounds while it says `down` (and is fresh) — a
+dead-session harvest would only worsen the kill, and its write-backs would
+delay the post-sign-in re-seed. The file's **age** is the liveness signal
+(every consumer reads a timestamp), so the watcher keeps publishing: every
+`COOKIE_STATE_HEARTBEAT` seconds while it is alive, and an answer nobody has
+re-confirmed within `COOKIE_SESSION_STALE` is published as `unknown` rather
+than frozen as `up` — `up` unproven must not keep a dead jar in use, and a
+watcher that wrote only on transitions made a healthy session look broken on
+a calm day.
 
 Env vars (all optional):
 - `NTFY_TOPIC` — ntfy.sh topic for `session_dead` / `session_restored` pushes
