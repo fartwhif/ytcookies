@@ -963,14 +963,27 @@ def main() -> None:
     prev_jar_login: bool | None = None  # jar login state at last probe
     last_ua_ask = 0.0
     ua_last_log = 0.0
+    # With no browser answering CDP - the parked state, and most of a watcher's
+    # life - fetch_cookies() fails on EVERY POLL_SECONDS tick. Un-throttled, that
+    # is ~120 identical "Connection refused" lines an hour for a watcher that is
+    # perfectly healthy and has simply nothing to read, and a week beside a
+    # parked vault reads as a fault log. The first failure prints at once (that
+    # is the one a live-browser failure needs), an identical repeat is throttled
+    # to hourly, and a DIFFERENT failure is news that prints at once.
+    last_fetch_err: str | None = None
+    fetch_err_logged = 0.0
 
     while True:
         try:
             cookies = fetch_cookies()
             fp = cookie_fingerprint(cookies)
             jar_login = _cookies_have_login(cookies)
+            last_fetch_err = None
         except Exception as exc:
-            log(f"jar fetch failed (browser/CDP {CDP_HOST}:{CDP_PORT}): {exc}")
+            err = f"jar fetch failed (browser/CDP {CDP_HOST}:{CDP_PORT}): {exc}"
+            if err != last_fetch_err or time.time() - fetch_err_logged >= 3600:
+                log(err)
+                last_fetch_err, fetch_err_logged = err, time.time()
             cookies, fp, jar_login = None, None, None
 
         # ---- user-agent: re-ask the browser on a cadence, push on change ----

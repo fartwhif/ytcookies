@@ -27,6 +27,13 @@ GET https://www.youtube.com/account with the file's cookies. Live -> the
 account page; killed -> 30x to accounts.google.com. No browser traffic is
 involved.
 
+Reading the browser jar needs a browser. While the vault is parked — which is
+most of a watcher's life — that read is a refused connection, so the first one
+logs and an identical repeat logs once an hour (a different failure prints at
+once: a browser that came up and fails some other way is news). The file probe,
+the verdict heartbeat and the notifications all run browserless, so a parked
+watcher keeps reporting with a quiet log.
+
 The vault tab otherwise idles on `about:blank` (owner's invariant): a warm
 signed-in page keeps rotating the browser's cookie copy and fights the
 consumers' write-backs on the file, so the tab only ever sits in a Google
